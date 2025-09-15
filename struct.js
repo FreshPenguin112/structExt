@@ -559,7 +559,13 @@ const demo = {
   metadata: { tags: ["demo", "测试"], preferences: { theme: "dark", itemsPerPage: 20 } },
   bio: "Loves ☕️, music, and long walks across the byte beach."
 };
-console.log(btoa(schema));
+console.log(
+  schema
+  .replace(/\/\/.*$/gm, '')                        // Remove single-line comments
+  .replace(/\/\*[\s\S]*?\*\//g, '')                // Remove multi-line comments
+  .replace(/\s+/g, ' ')                            // Collapse all whitespace to single space
+  .replace(/^\s+|\s+$/g, '')                       // Trim leading/trailing whitespace
+  );
 console.log(JSON.stringify(demo));
 /*
 // Node/browser base64 helpers (fall back to Buffer when btoa/atob absent)
