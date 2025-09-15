@@ -560,14 +560,19 @@ const demo = {
   bio: "Loves ☕️, music, and long walks across the byte beach."
 };
 console.log(
+  "Schema minified:\n\n" +
   schema
   .replace(/\/\/.*$/gm, '')                        // Remove single-line comments
   .replace(/\/\*[\s\S]*?\*\//g, '')                // Remove multi-line comments
   .replace(/\s+/g, ' ')                            // Collapse all whitespace to single space
   .replace(/^\s+|\s+$/g, '')                       // Trim leading/trailing whitespace
+  + "\n\nInput Data Minified:\n"
   );
-console.log(JSON.stringify(demo));
-/*
+console.log(
+  JSON.stringify(demo)
+  + "\n"
+  );
+
 // Node/browser base64 helpers (fall back to Buffer when btoa/atob absent)
 function bytesToBase64_compat(u8) {
   if (typeof btoa === 'function') return bytesToBase64(u8);
@@ -583,9 +588,9 @@ try {
   const encodedBytes = encoded instanceof Uint8Array ? encoded.length : base64ToBytes_compat(encoded).length;
   const encodedBase64 = encoded instanceof Uint8Array ? bytesToBase64_compat(encoded) : encoded;
 
-  console.log("--- Demo: MiniStruct encoding/decoding showcase ---");
-  console.log("Schema:\n", schema);
-  console.log("Original object:", demo);
+  console.log("--- Demo: MiniStruct encoding/decoding showcase ---\n");
+  console.log("Schema(unminified):\n", schema);
+  console.log("Input data object:", demo);
   console.log("Encoded (base64):", encodedBase64);
 
   const decoded = ms.decode("User", encoded instanceof Uint8Array ? encoded : base64ToBytes_compat(encoded));
@@ -597,4 +602,3 @@ try {
 } catch (e) {
   console.error("Demo Error:", e && e.message ? e.message : e);
 }
-*/
