@@ -1,11 +1,9 @@
 /*jshint esversion:11, bitwise:false*/
 
-// (moved into MiniStruct as static members)
-
-// ------------------------
-// MiniStruct class (schema parsing, encode, decode)
-// ------------------------
-// MiniStruct.js with enum support
+// MiniStruct class (schema parsing, encode, decode) with:
+// - recursive struct references
+// - optional properties using `Type? name;` syntax
+// - arrays using `Type[]` (can nest arbitrarily), arrays of `any` allowed
 class MiniStruct {
     constructor(schema) {
         this.structs = {};
@@ -49,6 +47,9 @@ class MiniStruct {
         return true;
     }
 
+    // ------------------------
+    // Schema parsing
+    // ------------------------
     parseSchema(schema) {
         // remove line comments but preserve spacing for brace matching
         schema = schema.replace(/\/\/.*$/gm, "");
@@ -114,6 +115,59 @@ class MiniStruct {
         return { nameToVal, valToName };
     }
 
+    // parse a type string like:
+    //   uint8[0,255]    -> object int descriptor
+    //   Address         -> string "Address" (struct/enum reference)
+    //   Address[]       -> { prim:'array', elem: 'Address' }
+    //   int[][]         -> nested arrays
+    //   string?         -> optional flag is handled by parseStructBody; here we return only the type descriptor
+    // Returns { typeDesc, optional }
+    parseTypeString(rawType, structName) {
+        let t = rawType.trim();
+        // detect optional marker ? appended to the type
+        let optional = false;
+        if (t.endsWith('?')) {
+            optional = true;
+            t = t.slice(0, -1).trim();
+        }
+
+        // count array nesting: trailing [] repeated
+        let arrayDepth = 0;
+        while (t.endsWith('[]')) {
+            arrayDepth++;
+            t = t.slice(0, -2).trim();
+        }
+
+        // parse integer flavors and optional ranges like uint8[0,255]
+        const intMatch = t.match(/^(int|uint8|int8|uint16|int16|uint32|int32|uint8|int)\s*(?:\[\s*([^,\]]+)\s*,\s*([^\]]+)\s*\])?$/);
+        let baseType;
+        if (intMatch) {
+            const name = intMatch[1];
+            const rangeA = intMatch[2];
+            const rangeB = intMatch[3];
+            if (rangeA !== undefined && rangeB !== undefined) {
+                const rmin = Number(rangeA);
+                const rmax = Number(rangeB);
+                if (!Number.isInteger(rmin) || !Number.isInteger(rmax)) throw new Error(`Schema parse error: invalid integer range for ${rawType} (struct ${structName})`);
+                try { this.constructor.validateRangeAgainstIntrinsic(name, rmin, rmax); } catch (e) { throw new Error(e.message + ` (field type ${rawType} in struct ${structName})`); }
+                baseType = { prim: 'int', name, range: [rmin, rmax] };
+            } else {
+                baseType = { prim: 'int', name, range: null };
+            }
+        } else {
+            // primitive keywords or references: string, float, float32, float64, bool, any, or enum/struct name
+            baseType = t; // keep as string; will be resolved in encode/decode/validation
+        }
+
+        // wrap arrays if any
+        let typeDesc = baseType;
+        for (let i = 0; i < arrayDepth; i++) {
+            typeDesc = { prim: 'array', elem: typeDesc };
+        }
+
+        return { typeDesc, optional };
+    }
+
     parseStructBody(body, structName) {
         const fields = [];
 
@@ -134,40 +188,41 @@ class MiniStruct {
             part = part.trim();
             if (!part) return;
 
-            let [decl, defVal] = part.split(":").map(s => s.trim());
+            let [decl, defVal] = part.split(":").map(s => s && s.trim());
             if (!decl) return;
             const tokens = decl.split(/\s+/).filter(Boolean);
             if (tokens.length < 2) return;
             const rawType = tokens[0];
-            // parse integer flavors and optional ranges like uint8[0,255]
-            let type;
-            const intMatch = rawType.match(/^(int|uint8|int8|uint16|int16|uint32|int32|uint8|int)\s*(?:\[\s*([^,\]]+)\s*,\s*([^\]]+)\s*\])?$/);
-            if (intMatch) {
-                const name = intMatch[1];
-                const rangeA = intMatch[2];
-                const rangeB = intMatch[3];
-                if (rangeA !== undefined && rangeB !== undefined) {
-                    const rmin = Number(rangeA);
-                    const rmax = Number(rangeB);
-                    if (!Number.isInteger(rmin) || !Number.isInteger(rmax)) throw new Error(`Schema parse error: invalid integer range for ${rawType}`);
-                    // validate range against intrinsic bounds
-                    try { this.constructor.validateRangeAgainstIntrinsic(name, rmin, rmax); } catch (e) { throw new Error(e.message + ` (field ${structName}.${tokens[1]})`); }
-                    type = { prim: 'int', name, range: [rmin, rmax] };
-                } else {
-                    type = { prim: 'int', name, range: null };
-                }
-            } else {
-                type = rawType;
-            }
             const name = tokens[1];
-            fields.push({ type, name, default: defVal, localEnums });
+
+            // parse the type string into descriptor + optional flag
+            const { typeDesc, optional } = this.parseTypeString(rawType, structName);
+
+            fields.push({ type: typeDesc, name, default: defVal, optional, localEnums });
         });
 
-        return { fields, localEnums };
+        // compute a helper: list of optional field indices (for presence bitmap)
+        const optionalIndices = [];
+        for (let i = 0; i < fields.length; i++) {
+            if (fields[i].optional) optionalIndices.push(i);
+        }
+
+        return { fields, localEnums, optionalIndices };
     }
 
-    // Descriptive validation used during encode to produce path-aware errors
+    // ------------------------
+    // Validation helpers (path-aware errors)
+    // ------------------------
     validateValueForField(fieldType, value, path, localEnums) {
+        // If type is an array descriptor
+        if (typeof fieldType === 'object' && fieldType.prim === 'array') {
+            if (!Array.isArray(value)) throw new Error(`Type violation at "${path}": Expected array, got ${typeof value} (${JSON.stringify(value)})`);
+            for (let i = 0; i < value.length; i++) {
+                this.validateValueForField(fieldType.elem, value[i], `${path}[${i}]`, localEnums);
+            }
+            return true;
+        }
+
         // integer object form
         if (typeof fieldType === 'object' && fieldType.prim === 'int') {
             if (!Number.isInteger(value)) throw new Error(`Type violation at "${path}": Expected integer (${fieldType.name}), got ${typeof value} (${JSON.stringify(value)})`);
@@ -184,7 +239,7 @@ class MiniStruct {
             return true;
         }
 
-        // string-like tokens
+        // string-like tokens (primitive names or references)
         if (typeof fieldType === 'string') {
             if (fieldType === 'int') {
                 if (!Number.isInteger(value)) throw new Error(`Type violation at "${path}": Expected integer, got ${typeof value} (${JSON.stringify(value)})`);
@@ -270,35 +325,59 @@ class MiniStruct {
             throw new Error("Unknown type: " + type);
         }
 
-        // object-shaped type (e.g., { prim: 'int', name, range })
-        if (typeof type === 'object' && type.prim === 'int') {
-            if (!Number.isInteger(val)) return false;
-            if (type.range) {
-                const [rmin, rmax] = type.range;
-                return val >= rmin && val <= rmax;
+        // object-shaped type (e.g., { prim: 'int', name, range } or {prim:'array', elem})
+        if (typeof type === 'object') {
+            if (type.prim === 'int') {
+                if (!Number.isInteger(val)) return false;
+                if (type.range) {
+                    const [rmin, rmax] = type.range;
+                    return val >= rmin && val <= rmax;
+                }
+                const bounds = this.constructor.intrinsicBoundsForInt(type.name);
+                if (!bounds) return true;
+                const [iMin, iMax] = bounds;
+                return val >= iMin && val <= iMax;
             }
-            // apply intrinsic bounds if available
-            const bounds = this.constructor.intrinsicBoundsForInt(type.name);
-            if (!bounds) return true;
-            const [iMin, iMax] = bounds;
-            return val >= iMin && val <= iMax;
+            if (type.prim === 'array') {
+                if (!Array.isArray(val)) return false;
+                for (let i = 0; i < val.length; i++) {
+                    if (!this.validateAgainstType(val[i], type.elem, localEnums)) return false;
+                }
+                return true;
+            }
         }
 
         // fallback: arrays and structs handled elsewhere in the newer API
         return true;
     }
 
+    // ------------------------
+    // Varint and fixed writers/readers (little-endian)
+    // ------------------------
     encodeVarint(num) {
         const bytes = [];
-        while (num > 127) {
-            bytes.push((num & 0x7f) | 0x80);
-            num >>>= 7;
+        // allow numeric up to JS safe integer; use positive integers only here.
+        let n = Number(num);
+        while (n > 127) {
+            bytes.push((n & 0x7f) | 0x80);
+            n = Math.floor(n / 128);
         }
-        bytes.push(num);
+        bytes.push(n);
         return Uint8Array.from(bytes);
     }
 
-    // Fixed-width integer and float helpers (little-endian)
+    decodeVarint(buf, offset) {
+        let num = 0, shift = 0, pos = offset;
+        while (true) {
+            if (pos >= buf.length) throw new Error("Buffer underflow while decoding varint");
+            let b = buf[pos++];
+            num |= (b & 0x7f) << shift;
+            if ((b & 0x80) === 0) break;
+            shift += 7;
+        }
+        return [num, pos];
+    }
+
     writeFixedInt(value, bits, signed) {
         const byteLen = bits / 8;
         const buf = new ArrayBuffer(byteLen);
@@ -351,68 +430,219 @@ class MiniStruct {
         return [dv.getFloat64(0, true), pos + 8];
     }
 
-    decodeVarint(buf, offset) {
-        let num = 0, shift = 0, pos = offset;
-        while (true) {
-            let b = buf[pos++];
-            num |= (b & 0x7f) << shift;
-            if ((b & 0x80) === 0) break;
-            shift += 7;
+    // ------------------------
+    // Generic encode/decode helpers for arbitrary type descriptors
+    // - encodeValueByType(typeDesc, value, path, localEnums) => Uint8Array (bytes)
+    // - decodeValueByType(typeDesc, buf, pos, localEnums) => [value, newPos]
+    // ------------------------
+    encodeValueByType(typeDesc, value, path, localEnums) {
+        const bytes = [];
+        // arrays
+        if (typeof typeDesc === 'object' && typeDesc.prim === 'array') {
+            if (!Array.isArray(value)) throw new Error(`Type violation at "${path}": Expected array`);
+            // length-prefixed
+            bytes.push(...this.encodeVarint(value.length));
+            for (let i = 0; i < value.length; i++) {
+                const child = this.encodeValueByType(typeDesc.elem, value[i], `${path}[${i}]`, localEnums);
+                bytes.push(...child);
+            }
+            return Uint8Array.from(bytes);
         }
-        return [num, pos];
+
+        // integer object form
+        if (typeof typeDesc === 'object' && typeDesc.prim === 'int') {
+            // check range
+            if (!Number.isInteger(value)) throw new Error(`Type violation at "${path}": Expected integer`);
+            if (typeDesc.range) {
+                const [rmin, rmax] = typeDesc.range;
+                if (value < rmin || value > rmax) throw new Error(`Value for ${path} out of declared range ${rmin}..${rmax}`);
+            }
+            const info = MiniStruct.INT_TYPES[typeDesc.name] || MiniStruct.INT_TYPES['int'];
+            if (info) return this.writeFixedInt(value, info.bits, info.signed);
+            return this.encodeVarint(value);
+        }
+
+        // primitives by string or references
+        if (typeof typeDesc === 'string') {
+            if (typeDesc === 'string') {
+                const enc = new TextEncoder().encode(value);
+                return Uint8Array.from([...this.encodeVarint(enc.length), ...enc]);
+            }
+            if (typeDesc === 'any') {
+                const s = JSON.stringify(value);
+                const enc = new TextEncoder().encode(s);
+                return Uint8Array.from([...this.encodeVarint(enc.length), ...enc]);
+            }
+            if (typeDesc === 'bool') {
+                return Uint8Array.from([value ? 1 : 0]);
+            }
+            if (typeDesc === 'float' || typeDesc === 'float64') {
+                return this.writeFloat64(value);
+            }
+            if (typeDesc === 'float32') {
+                return this.writeFloat32(value);
+            }
+            // enum (local first)
+            if (localEnums && localEnums[typeDesc]) {
+                const e = localEnums[typeDesc];
+                const num = typeof value === "string" ? e.nameToVal[value] : value;
+                return Uint8Array.from(this.encodeVarint(num));
+            }
+            if (this.enums[typeDesc]) {
+                const e = this.enums[typeDesc];
+                const num = typeof value === "string" ? e.nameToVal[value] : value;
+                return Uint8Array.from(this.encodeVarint(num));
+            }
+            // struct reference (recursive allowed)
+            if (this.structs[typeDesc]) {
+                const enc = this.encode(typeDesc, value);
+                return Uint8Array.from([...this.encodeVarint(enc.length), ...enc]);
+            }
+
+            throw new Error(`Unknown type while encoding: ${typeDesc} at ${path}`);
+        }
+
+        throw new Error(`Unsupported type descriptor when encoding at ${path}`);
     }
 
+    decodeValueByType(typeDesc, buf, pos, localEnums) {
+        // arrays
+        if (typeof typeDesc === 'object' && typeDesc.prim === 'array') {
+            let [len, p2] = this.decodeVarint(buf, pos);
+            pos = p2;
+            const arr = [];
+            for (let i = 0; i < len; i++) {
+                const [v, np] = this.decodeValueByType(typeDesc.elem, buf, pos, localEnums);
+                arr.push(v);
+                pos = np;
+            }
+            return [arr, pos];
+        }
+
+        // integer object form
+        if (typeof typeDesc === 'object' && typeDesc.prim === 'int') {
+            const info = MiniStruct.INT_TYPES[typeDesc.name] || MiniStruct.INT_TYPES['int'];
+            if (info) {
+                const [v, np] = this.readFixedInt(buf, pos, info.bits, info.signed);
+                return [v, np];
+            }
+            // fallback to varint
+            const [v2, np2] = this.decodeVarint(buf, pos);
+            return [v2, np2];
+        }
+
+        // primitives or references by string
+        if (typeof typeDesc === 'string') {
+            if (typeDesc === 'string') {
+                let [len, p2] = this.decodeVarint(buf, pos);
+                pos = p2;
+                const s = new TextDecoder().decode(buf.slice(pos, pos + len));
+                return [s, pos + len];
+            }
+            if (typeDesc === 'any') {
+                let [len, p2] = this.decodeVarint(buf, pos);
+                pos = p2;
+                const s = new TextDecoder().decode(buf.slice(pos, pos + len));
+                try { return [JSON.parse(s), pos + len]; } catch { return [s, pos + len]; }
+            }
+            if (typeDesc === 'bool') {
+                return [!!buf[pos], pos + 1];
+            }
+            if (typeDesc === 'float' || typeDesc === 'float64') {
+                return this.readFloat64(buf, pos);
+            }
+            if (typeDesc === 'float32') {
+                return this.readFloat32(buf, pos);
+            }
+            // enums
+            if (localEnums && localEnums[typeDesc]) {
+                let [num, p2] = this.decodeVarint(buf, pos);
+                pos = p2;
+                const e = localEnums[typeDesc];
+                return [e.valToName[num] ?? num, pos];
+            }
+            if (this.enums[typeDesc]) {
+                let [num, p2] = this.decodeVarint(buf, pos);
+                pos = p2;
+                const e = this.enums[typeDesc];
+                return [e.valToName[num] ?? num, pos];
+            }
+            // struct
+            if (this.structs[typeDesc]) {
+                let [len, p2] = this.decodeVarint(buf, pos);
+                pos = p2;
+                const subbuf = buf.slice(pos, pos + len);
+                const obj = this.decode(typeDesc, subbuf, 0);
+                return [obj, pos + len];
+            }
+
+            throw new Error(`Unknown type while decoding: ${typeDesc}`);
+        }
+
+        throw new Error(`Unsupported type descriptor while decoding`);
+    }
+
+    // ------------------------
+    // Top-level encode/decode for named struct
+    // - encode(typeName, obj) => Uint8Array
+    // - decode(typeName, buf, offset=0) => object
+    // ------------------------
     encode(typeName, obj) {
         const struct = this.structs[typeName];
         if (!struct) throw new Error("Unknown struct: " + typeName);
 
+        // Field presence and encoding
         const bytes = [];
-        for (const field of struct.fields) {
-            let val = obj[field.name] ?? field.default;
-            if (val === undefined) continue;
-            // produce descriptive, path-aware errors
-            this.validateValueForField(field.type, val, `${typeName}.${field.name}`, struct.localEnums);
 
-            // encode by type
-            // integer flavors: support type object { prim:'int', name, range }
-            if ((typeof field.type === 'object' && field.type.prim === 'int') || field.type === "int") {
-                // validate range if present
-                if (typeof field.type === 'object' && field.type.range) {
-                    const [rmin, rmax] = field.type.range;
-                    if (val < rmin || val > rmax) throw new Error(`Value for ${field.name} out of declared range ${rmin}..${rmax}`);
-                }
-                // determine integer width and signedness
-                let typeName = typeof field.type === 'object' ? field.type.name : 'int';
-                const info = MiniStruct.INT_TYPES[typeName] || MiniStruct.INT_TYPES['int'];
-                if (info) {
-                    bytes.push(...this.writeFixedInt(val, info.bits, info.signed));
+        // If the struct has optional fields, we will compose a presence bitmask and write it first.
+        const optionalIndices = struct.optionalIndices || [];
+        const hasOptionals = optionalIndices.length > 0;
+        // We'll collect the body bytes (fields) then prefix presence varint if needed.
+        const bodyBytes = [];
+
+        for (let fi = 0; fi < struct.fields.length; fi++) {
+            const field = struct.fields[fi];
+            // presence detection: prefer own property over '?? default' so we can detect absent vs present-with-undefined
+            const hasOwn = Object.prototype.hasOwnProperty.call(obj, field.name);
+            let val = hasOwn ? obj[field.name] : (field.default !== undefined ? field.default : undefined);
+
+            if (val === undefined) {
+                if (field.optional) {
+                    // absent optional -> don't encode its bytes (presence bit will be 0)
+                    continue;
                 } else {
-                    // fallback to varint for unknown sizes
-                    bytes.push(...this.encodeVarint(val));
+                    // missing non-optional field that has no default is an error
+                    throw new Error(`Missing required field ${typeName}.${field.name}`);
                 }
-            } else if (field.type === "string") {
-                const enc = new TextEncoder().encode(val);
-                bytes.push(...this.encodeVarint(enc.length), ...enc);
-            } else if (field.type === "any") {
-                // encode any as JSON string (length-prefixed)
-                const s = JSON.stringify(val);
-                const enc = new TextEncoder().encode(s);
-                bytes.push(...this.encodeVarint(enc.length), ...enc);
-            } else if (field.type === "bool") {
-                bytes.push(val ? 1 : 0);
-            } else if (field.type === "float" || field.type === 'float64') {
-                bytes.push(...this.writeFloat64(val));
-            } else if (field.type === 'float32') {
-                bytes.push(...this.writeFloat32(val));
-            } else if (struct.localEnums[field.type] || this.enums[field.type]) {
-                const e = struct.localEnums[field.type] || this.enums[field.type];
-                const num = typeof val === "string" ? e.nameToVal[val] : val;
-                bytes.push(...this.encodeVarint(num));
-            } else if (this.structs[field.type]) {
-                const enc = this.encode(field.type, val);
-                bytes.push(...this.encodeVarint(enc.length), ...enc);
             }
+
+            // validate value (path-aware)
+            this.validateValueForField(field.type, val, `${typeName}.${field.name}`, field.localEnums ?? struct.localEnums);
+
+            // encode field value according to its type (returned Uint8Array)
+            const enc = this.encodeValueByType(field.type, val, `${typeName}.${field.name}`, field.localEnums ?? struct.localEnums);
+            bodyBytes.push(...enc);
         }
+
+        // build and prefix presence bitmask if the struct had optionals
+        if (hasOptionals) {
+            let mask = 0;
+            // optionalIndices is an array of field indices that are optional, mapped to bit positions 0..n-1
+            for (let bitPos = 0; bitPos < optionalIndices.length; bitPos++) {
+                const fieldIndex = optionalIndices[bitPos];
+                const field = struct.fields[fieldIndex];
+                const hasOwn = Object.prototype.hasOwnProperty.call(obj, field.name);
+                const val = hasOwn ? obj[field.name] : (field.default !== undefined ? field.default : undefined);
+                if (val !== undefined) {
+                    // present -> set bit
+                    mask += (1 << bitPos); // safe for reasonably sized optional counts
+                }
+            }
+            bytes.push(...this.encodeVarint(mask));
+        }
+
+        // append body
+        bytes.push(...bodyBytes);
         return Uint8Array.from(bytes);
     }
 
@@ -422,52 +652,51 @@ class MiniStruct {
         const obj = {};
         let pos = offset;
 
-        for (const field of struct.fields) {
-            if (pos >= buf.length) break;
+        // read presence mask if necessary
+        const optionalIndices = struct.optionalIndices || [];
+        const hasOptionals = optionalIndices.length > 0;
+        let presenceMask = 0;
+        if (hasOptionals) {
+            let pm;
+            [pm, pos] = this.decodeVarint(buf, pos);
+            presenceMask = pm;
+        }
 
-            if ((typeof field.type === 'object' && field.type.prim === 'int') || field.type === "int") {
-                let typeName = (typeof field.type === 'object') ? field.type.name : 'int';
-                const info = MiniStruct.INT_TYPES[typeName] || MiniStruct.INT_TYPES['int'];
-                if (info) {
-                    [obj[field.name], pos] = this.readFixedInt(buf, pos, info.bits, info.signed);
-                } else {
-                    [obj[field.name], pos] = this.decodeVarint(buf, pos);
-                }
-            } else if (field.type === "string") {
-                let [len, p2] = this.decodeVarint(buf, pos);
-                pos = p2;
-                obj[field.name] = new TextDecoder().decode(buf.slice(pos, pos + len));
-                pos += len;
-            } else if (field.type === "any") {
-                let [len, p2] = this.decodeVarint(buf, pos);
-                pos = p2;
-                const s = new TextDecoder().decode(buf.slice(pos, pos + len));
-                pos += len;
-                try { obj[field.name] = JSON.parse(s); } catch { obj[field.name] = s; }
-            } else if (field.type === "bool") {
-                obj[field.name] = !!buf[pos++];
-            } else if (field.type === "float" || field.type === 'float64') {
-                [obj[field.name], pos] = this.readFloat64(buf, pos);
-            } else if (field.type === 'float32') {
-                [obj[field.name], pos] = this.readFloat32(buf, pos);
-            } else if (struct.localEnums[field.type] || this.enums[field.type]) {
-                let [num, p2] = this.decodeVarint(buf, pos);
-                pos = p2;
-                const e = struct.localEnums[field.type] || this.enums[field.type];
-                obj[field.name] = e.valToName[num] ?? num;
-            } else if (this.structs[field.type]) {
-                let [len, p2] = this.decodeVarint(buf, pos);
-                pos = p2;
-                obj[field.name] = this.decode(field.type, buf.slice(pos, pos + len));
-                pos += len;
+        // iterate fields in declared order
+        // for optional fields, consult presenceMask to know if value present
+        // for required fields, always attempt to decode (but if buffer ends, break)
+        let optionalBitCounter = 0;
+        for (let fi = 0; fi < struct.fields.length; fi++) {
+            const field = struct.fields[fi];
+
+            // if buffer ended, stop
+            if (pos >= buf.length) {
+                // remaining fields remain undefined (if optional) else omitted
+                break;
             }
+
+            if (field.optional) {
+                const bitPos = optionalBitCounter++;
+                const present = ((presenceMask >> bitPos) & 1) === 1;
+                if (!present) {
+                    // absent optional field -> leave undefined / skip decoding
+                    continue;
+                }
+                // else decode as usual
+            }
+
+            // decode value by type
+            const [val, newPos] = this.decodeValueByType(field.type, buf, pos, field.localEnums ?? struct.localEnums);
+            obj[field.name] = val;
+            pos = newPos;
         }
 
         return obj;
     }
 }
+
 // ------------------------
-// Example usage — expanded demo showcasing features
+// Demo schema showing recursive struct, optionals, and arrays
 // ------------------------
 let schema = `
 // Global enum
@@ -483,6 +712,13 @@ struct Address {
   int zip;
 }
 
+// Recursive Node example: a Node can optionally point to another Node, and have a typed array of children Nodes.
+struct Node {
+  int value;
+  Node? next;        // optional recursive link
+  Node[] children;   // array of Nodes (can be nested deeper)
+}
+
 struct User {
   // inline enum for role
   enum Role { ADMIN = 1; USER = 2; GUEST = 3; }
@@ -496,77 +732,52 @@ struct User {
   Color favoriteColor;
   any metadata; // arbitrary JSON blob
   string bio; // unicode-friendly text
+  string[] tags; // array of strings
+  Node? rootNode; // optional recursive root
 }
 `;
+
 const ms = new MiniStruct(schema);
 
-let demo = {
-    name: "Joséphine ✨", // unicode
+// demo object with recursion and arrays
+const demoNode = { value: 1, next: { value: 2, next: undefined, children: [] }, children: [{ value: 10, children: [] }] };
+const demo = {
+    name: "Joséphine ✨",
     id: 42,
     score: 98.6,
     active: true,
-    address: {
-        street: "123 Café Blvd",
-        city: "Zürich",
-        zip: 8001
-    },
-    role: "ADMIN", // using enum name
-    favoriteColor: "BLUE", // global enum name
-    metadata: { tags: ["demo", "测试"], preferences: { theme: "dark", itemsPerPage: 20 } },
-    bio: "Loves ☕️, music, and long walks across the byte beach."
+    address: { street: "123 Café Blvd", city: "Zürich", zip: 8001 },
+    role: "ADMIN",
+    favoriteColor: "BLUE",
+    metadata: { tags: ["demo", "测试"], prefs: { theme: "dark" } },
+    bio: "Loves ☕️, music, and bytes.",
+    tags: ["alpha", "β"],
+    rootNode: demoNode
 };
-console.log(
-    "Schema minified:\n\n" +
-    schema
-        .replace(/\/\/.*$/gm, '')                        // Remove single-line comments
-        .replace(/\/\*[\s\S]*?\*\//g, '')                // Remove multi-line comments
-        .replace(/\s+/g, ' ')                            // Collapse all whitespace to single space
-        .replace(/^\s+|\s+$/g, '')                       // Trim leading/trailing whitespace
-    + "\n\nInput Data Minified:\n"
-);
-console.log(
-    JSON.stringify(demo)
-    + "\n"
-);
 
-function bytesToBase64(u8) {
-    // btoa expects binary string
-    let s = "";
-    for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-    return btoa(s);
-}
-function base64ToBytes(b64) {
-    const s = atob(b64);
-    const arr = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i);
-    return arr;
-}
-// Node/browser base64 helpers (fall back to Buffer when btoa/atob absent)
 function bytesToBase64_compat(u8) {
-    if (typeof btoa === 'function') return bytesToBase64(u8);
+    if (typeof btoa === 'function') {
+        let s = "";
+        for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s);
+    }
     return Buffer.from(u8).toString('base64');
 }
 function base64ToBytes_compat(b64) {
-    if (typeof atob === 'function') return base64ToBytes(b64);
+    if (typeof atob === 'function') {
+        const s = atob(b64);
+        const arr = new Uint8Array(s.length);
+        for (let i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i);
+        return arr;
+    }
     return Uint8Array.from(Buffer.from(b64, 'base64'));
 }
 
 try {
     const encoded = ms.encode("User", demo);
-    const encodedBytes = encoded instanceof Uint8Array ? encoded.length : base64ToBytes_compat(encoded).length;
-    const encodedBase64 = encoded instanceof Uint8Array ? bytesToBase64_compat(encoded) : encoded;
-
-    console.log("--- Demo: MiniStruct encoding/decoding showcase ---\n");
-    console.log("Schema(unminified):\n", schema);
-    console.log("Input data object:", demo);
-    console.log("Encoded (base64):", encodedBase64);
-
-    const decoded = ms.decode("User", encoded instanceof Uint8Array ? encoded : base64ToBytes_compat(encoded));
+    console.log("Encoded (base64):", bytesToBase64_compat(encoded));
+    const decoded = ms.decode("User", encoded);
     console.log("Decoded object:", decoded);
-
-    const jsonBytes = new TextEncoder().encode(JSON.stringify(demo)).length;
-    const efficiency = ((1 - encodedBytes / jsonBytes) * 100).toFixed(2);
-    console.log(`Final efficiency: ${efficiency}% (encoded ${encodedBytes} bytes vs JSON ${jsonBytes} bytes)`);
 } catch (e) {
     console.error("Demo Error:", e && e.message ? e.message : e);
 }
